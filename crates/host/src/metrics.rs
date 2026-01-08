@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sysinfo::System;
+use sysinfo::{System,ProcessesToUpdate};
 use tokio::task::JoinHandle;
 use wasmcloud_tracing::{
     Counter, Gauge, Histogram, KeyValue, Meter, ObservableGauge, UpDownCounter,
@@ -26,19 +26,15 @@ pub struct HostMetrics {
 
     /// The total amount of available system memory in bytes.
     pub system_total_memory_bytes: ObservableGauge<u64>,
-    /// The total amount of used system memory in bytes.
-    pub system_used_memory_bytes: ObservableGauge<u64>,
-    /// The total cpu usage.
-    pub system_cpu_usage: ObservableGauge<f64>,
+    /// Used system memory in bytes of the host.
+    pub host_used_memory_bytes: ObservableGauge<u64>,
+    /// The total cpu usage of the host.
+    pub host_cpu_usage: ObservableGauge<f64>,
 
     /// The host's ID.
-    // TODO this is actually configured as an InstrumentationScope attribute on the global meter,
-    // but we don't really have a way of getting at those. We should figure out a way to get at that
-    // information so we don't have to duplicate it here.
     pub host_id: String,
+
     /// The host's lattice ID.
-    // Eventually a host will be able to support multiple lattices, so this will need to either be
-    // removed or metrics will need to be scoped per-lattice.
     pub lattice_id: String,
 
     // Task handle for dropping when the metrics are no longer needed.
@@ -47,10 +43,8 @@ pub struct HostMetrics {
 
 struct SystemMetrics {
     system_total_memory_bytes: u64,
-    /// The total amount of used system memory in bytes.
-    system_used_memory_bytes: u64,
-    /// The total cpu usage.
-    system_cpu_usage: f64,
+    host_used_memory_bytes: u64,
+    host_cpu_usage: f64,
 }
 
 /// A helper struct for encapsulating the system metrics that should be wrapped in an Arc.
@@ -104,33 +98,56 @@ impl HostMetrics {
             .with_description("Maximum number of component instances")
             .build();
 
+        // Initialize sysinfo to read system metrics
         let mut system = System::new();
-        // Get the initial metrics
+
+        // Refresh total system memory
         system.refresh_memory();
-        system.refresh_cpu_usage();
+
+        // Get the current process PID
+        let pid = sysinfo::get_current_pid().map_err(
+            |e| anyhow::anyhow!("Failed to get current pid: {:?}", e)
+        )?;
+
+        // Refresh processes and initial memory
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        
+        // Get the current process info
+        let process = system.process(pid).ok_or_else(|| {
+            anyhow::anyhow!("Process with pid {:?} not found during metrics initialization", pid)
+        })?;
+
+        // Initialize the metrics
         let initial_metrics = SystemMetrics {
             system_total_memory_bytes: system.total_memory(),
-            system_used_memory_bytes: system.used_memory(),
-            system_cpu_usage: system.global_cpu_usage() as f64,
+            host_used_memory_bytes: process.memory(),
+            host_cpu_usage: process.cpu_usage() as f64,
         };
+
+        // Watch channel to share metrics between refresh task and the gauges
         let (tx, rx) = tokio::sync::watch::channel(initial_metrics);
 
         let refresh_time = refresh_time.unwrap_or(DEFAULT_REFRESH_TIME);
 
+        // Async task that periodically refreshes metrics
         let refresh_task_handle = tokio::spawn(async move {
             loop {
                 system.refresh_memory();
-                system.refresh_cpu_usage();
+                system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                
+                if let Some(proc) = system.process(pid) {
+                    tx.send_modify(|current| {
+                        current.system_total_memory_bytes = system.total_memory();
 
-                tx.send_modify(|current| {
-                    current.system_total_memory_bytes = system.total_memory();
-                    current.system_used_memory_bytes = system.used_memory();
-                    current.system_cpu_usage = system.global_cpu_usage() as f64;
-                });
+                        current.host_used_memory_bytes = proc.memory();
+                        current.host_cpu_usage = proc.cpu_usage() as f64;
+                    });
+                }
                 tokio::time::sleep(refresh_time).await;
             }
         });
-        // System Memory
+
+        // Observable gauge for total system memory
         let system_memory_total_bytes = meter
             .u64_observable_gauge("wasmcloud_host.process.memory.total.bytes")
             .with_description("The total amount of memory in bytes")
@@ -143,30 +160,45 @@ impl HostMetrics {
                 }
             })
             .build();
-
-        let system_memory_used_bytes = meter
+        
+        // Clone host_id and lattice_id for use in callbacks
+        let host_id_clone = host_id.clone();
+        let lattice_id_clone = lattice_id.clone();
+        
+         // Observable gauge for host used memory
+        let host_memory_used_bytes = meter
             .u64_observable_gauge("wasmcloud_host.process.memory.used.bytes")
             .with_description("The used amount of memory in bytes")
             .with_unit("bytes")
             .with_callback({
                 let rx_clone = rx.clone();
+                let host_id = host_id_clone.clone();
+                let lattice_id = lattice_id_clone.clone();
                 move |observer| {
                     let metrics = rx_clone.borrow();
-                    observer.observe(metrics.system_used_memory_bytes, &[]);
+                    observer.observe(metrics.host_used_memory_bytes, &[
+                        KeyValue::new("host_id", host_id.clone()),
+                        KeyValue::new("lattice_id", lattice_id.clone()),
+                    ]);
                 }
             })
             .build();
 
-        // System CPU
-        let system_cpu_usage = meter
+        // Observable gauge for host CPU usage
+        let host_cpu_usage = meter
             .f64_observable_gauge("wasmcloud_host.process.cpu.usage")
             .with_description("The CPU usage of the process")
             .with_unit("percentage")
             .with_callback({
                 let rx = rx.clone();
+                let host_id = host_id_clone.clone();
+                let lattice_id = lattice_id_clone.clone();
                 move |observer| {
                     let metrics = rx.borrow();
-                    observer.observe(metrics.system_cpu_usage, &[]);
+                    observer.observe(metrics.host_cpu_usage, &[
+                        KeyValue::new("host_id", host_id.clone()),
+                        KeyValue::new("lattice_id", lattice_id.clone()),
+                    ]);
                 }
             })
             .build();
@@ -178,8 +210,8 @@ impl HostMetrics {
             component_active_instances,
             component_max_instances,
             system_total_memory_bytes: system_memory_total_bytes,
-            system_used_memory_bytes: system_memory_used_bytes,
-            system_cpu_usage,
+            host_used_memory_bytes: host_memory_used_bytes,
+            host_cpu_usage: host_cpu_usage,
             host_id,
             lattice_id,
             _refresh_task_handle: Arc::new(RefreshWrapper(refresh_task_handle)),
