@@ -103,6 +103,7 @@ impl HostMetrics {
 
         // Refresh total system memory
         system.refresh_memory();
+        system.refresh_cpu();
 
         // Get the current process PID
         let pid = sysinfo::get_current_pid().map_err(
@@ -133,6 +134,7 @@ impl HostMetrics {
         let refresh_task_handle = tokio::spawn(async move {
             loop {
                 system.refresh_memory();
+                system.refresh_cpu();
                 system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
                 
                 if let Some(proc) = system.process(pid) {
