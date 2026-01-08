@@ -31,10 +31,10 @@ pub struct HostMetrics {
     /// The total cpu usage of the host.
     pub host_cpu_usage: ObservableGauge<f64>,
 
-    /// The host's ID.
+    /// The host ID.
     pub host_id: String,
 
-    /// The host's lattice ID.
+    /// The host lattice ID.
     pub lattice_id: String,
 
     // Task handle for dropping when the metrics are no longer needed.
