@@ -1,13 +1,15 @@
 use std::sync::Arc;
 use std::time::Duration;
+use std::collections::VecDeque; 
 
-use sysinfo::{System,ProcessesToUpdate};
+use psutil::process::Process;
+use psutil::memory::virtual_memory;
 use tokio::task::JoinHandle;
 use wasmcloud_tracing::{
     Counter, Gauge, Histogram, KeyValue, Meter, ObservableGauge, UpDownCounter,
 };
 
-const DEFAULT_REFRESH_TIME: Duration = Duration::from_secs(5);
+const DEFAULT_REFRESH_TIME: Duration = Duration::from_millis(250);
 
 /// `HostMetrics` encapsulates the set of metrics emitted by the wasmcloud host
 #[derive(Clone, Debug)]
@@ -98,31 +100,24 @@ impl HostMetrics {
             .with_description("Maximum number of component instances")
             .build();
 
-        // Initialize sysinfo to read system metrics
-        let mut system = System::new();
-
-        // Refresh total system memory
-        system.refresh_memory();
-        system.refresh_cpu_usage();
-
-        // Get the current process PID
-        let pid = sysinfo::get_current_pid().map_err(
-            |e| anyhow::anyhow!("Failed to get current pid: {:?}", e)
-        )?;
-
-        // Refresh processes and initial memory
-        system.refresh_processes(ProcessesToUpdate::All, true);
+        // Initialize psutil to read system metrics
+        // Get initial system memory
+        let sys_memory = virtual_memory()
+            .map_err(|e| anyhow::anyhow!("Failed to get system memory: {:?}", e))?;
         
-        // Get the current process info
-        let process = system.process(pid).ok_or_else(|| {
-            anyhow::anyhow!("Process with pid {:?} not found during metrics initialization", pid)
-        })?;
-
+        // Get current process
+        let process = Process::current()
+            .map_err(|e| anyhow::anyhow!("Failed to get current process: {:?}", e))?;
+        
+        // Get initial process memory info (RSS)
+        let memory_info = process.memory_info()
+            .map_err(|e| anyhow::anyhow!("Failed to get process memory info: {:?}", e))?;
+        
         // Initialize the metrics
         let initial_metrics = SystemMetrics {
-            system_total_memory_bytes: system.total_memory(),
-            host_used_memory_bytes: process.memory(),
-            host_cpu_usage: process.cpu_usage() as f64,
+            system_total_memory_bytes: sys_memory.total(),
+            host_used_memory_bytes: memory_info.rss(),  // Using RSS instead of virtual memory
+            host_cpu_usage: 0.0,  // Will be calculated properly after first interval
         };
 
         // Watch channel to share metrics between refresh task and the gauges
@@ -132,19 +127,68 @@ impl HostMetrics {
 
         // Async task that periodically refreshes metrics
         let refresh_task_handle = tokio::spawn(async move {
-            loop {
-                system.refresh_memory();
-                system.refresh_cpu_usage();
-                system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-                
-                if let Some(proc) = system.process(pid) {
-                    tx.send_modify(|current| {
-                        current.system_total_memory_bytes = system.total_memory();
-
-                        current.host_used_memory_bytes = proc.memory();
-                        current.host_cpu_usage = proc.cpu_usage() as f64;
-                    });
+            let mut cpu_readings = VecDeque::with_capacity(10);
+            const MAX_READINGS: usize = 10; // Promedio de 10 lecturas
+            
+            // Get process for this async task
+            let process = match Process::current() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to get current process in refresh task: {:?}", e);
+                    return;
                 }
+            };
+            
+            // Sleep briefly to get first proper CPU measurement
+            tokio::time::sleep(refresh_time).await;
+            
+            loop {
+                // Get system memory
+                let sys_memory = match virtual_memory() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("Failed to get system memory: {:?}", e);
+                        continue;
+                    }
+                };
+                
+                // Get process memory info (RSS)
+                let memory_info = match process.memory_info() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("Failed to get process memory info: {:?}", e);
+                        continue;
+                    }
+                };
+                
+                // Get CPU usage
+                let cpu_percent = match process.cpu_percent() {
+                    Ok(cpu) => cpu as f64,
+                    Err(e) => {
+                        eprintln!("Failed to get CPU usage: {:?}", e);
+                        0.0
+                    }
+                };
+                
+                // Apply moving average for CPU
+                cpu_readings.push_back(cpu_percent);
+                if cpu_readings.len() > MAX_READINGS {
+                    cpu_readings.pop_front();
+                }
+
+                // Calculate average (with protection against division by zero)
+                let avg_cpu = if !cpu_readings.is_empty() {
+                    cpu_readings.iter().sum::<f64>() / cpu_readings.len() as f64
+                } else {
+                    cpu_percent
+                };
+
+                tx.send_modify(|current| {
+                    current.system_total_memory_bytes = sys_memory.total();
+                    current.host_used_memory_bytes = memory_info.rss();  // Using RSS
+                    current.host_cpu_usage = avg_cpu;
+                });
+                
                 tokio::time::sleep(refresh_time).await;
             }
         });
@@ -167,7 +211,7 @@ impl HostMetrics {
         let host_id_clone = host_id.clone();
         let lattice_id_clone = lattice_id.clone();
         
-         // Observable gauge for host used memory
+        // Observable gauge for host used memory
         let host_memory_used_bytes = meter
             .u64_observable_gauge("wasmcloud_host.process.memory.used.bytes")
             .with_description("The used amount of memory in bytes")
